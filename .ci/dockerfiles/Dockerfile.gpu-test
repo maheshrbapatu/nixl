@@ -23,12 +23,15 @@ ARG HAS_GPU=true
 ARG WORKSPACE=/workspace/nixl
 
 
+RUN sudo apt-get update && \
+    sudo apt-get install -y --no-install-recommends gdb gdb-multiarch && \
+    sudo apt-get clean && \
+    sudo rm -rf /var/lib/apt/lists/*
+
 WORKDIR ${WORKSPACE}
 COPY --chown="${_UID}":"${_GID}" . .
 
 RUN .gitlab/build.sh ${NIXL_INSTALL_DIR}
-RUN sudo apt-get clean && \
-    sudo rm -rf /var/lib/apt/lists/*
 
 ENTRYPOINT ["/bin/bash", "-c", "exec \"$@\"", "--"]
 
