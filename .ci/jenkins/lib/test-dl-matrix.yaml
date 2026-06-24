@@ -119,10 +119,10 @@ steps:
       # NOTE: the original slurmCI steps set these via slurmEnv (per-run SLURM env injection).
       # In the single-session Lyris model all four tests run in one srun; the inline
       # prefix approach is equivalent but scopes the var to that command only.
-      printf 'python\t.gitlab/test_python.sh ${NIXL_INSTALL_DIR}\n' > tc.txt
-      printf 'rust\t.gitlab/test_rust.sh ${NIXL_INSTALL_DIR}\n' >> tc.txt
-      printf 'cpp\tUCX_IB_REG_METHODS=rcache .gitlab/test_cpp.sh ${NIXL_INSTALL_DIR}\n' >> tc.txt
-      printf 'nixlbench\tHAS_GPU=false .gitlab/test_nixlbench.sh ${NIXL_INSTALL_DIR}\n' >> tc.txt
+      printf "python\t.gitlab/test_python.sh ${NIXL_INSTALL_DIR}\n" > tc.txt
+      printf "rust\t.gitlab/test_rust.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
+      printf "cpp\tUCX_IB_REG_METHODS=rcache .gitlab/test_cpp.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
+      printf "nixlbench\tHAS_GPU=false .gitlab/test_nixlbench.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
       TRIGGER_TOKEN=${LYRIS_TRIGGER_TOKEN} GITLAB_TOKEN=${LYRIS_API_TOKEN} \
       .ci/scripts/trigger_and_wait.sh \
         --ref ${LYRIS_PIPELINE_REF} \
