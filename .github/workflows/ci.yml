@@ -24,7 +24,6 @@ on:
   pull_request:
   push:
     branches: [main, 'release/**']
-    tags: ['v*']
   workflow_dispatch:
     inputs:
       release_build:
@@ -61,6 +60,10 @@ jobs:
   # version: replicate the GitLab before_script version computation.
   # ----------------------------------------------------------------------------
   version:
+    # Don't run fork-PR code on the self-hosted IRSA-backed builders (they have ECR write
+    # access and this workflow publishes). Allow push/dispatch + same-repo (collaborator)
+    # PRs; skip pull_requests from forks. build/uploads inherit this via `needs`. (CodeRabbit.)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ vars.NIXL_RUNNER_PREFIX || 'prod' }}-nixl-builder-amd-v1
     outputs:
       version: ${{ steps.compute.outputs.version }}
@@ -100,6 +103,8 @@ jobs:
   # ----------------------------------------------------------------------------
   build:
     needs: version
+    # Same fork-PR guard as `version` (explicit; not just inherited via needs).
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ${{ vars.NIXL_RUNNER_PREFIX || 'prod' }}-nixl-builder-${{ matrix.runner }}-v1
     timeout-minutes: 120  # ARM manylinux builds everything from source (~60min); was timing out at the push step
     strategy:
