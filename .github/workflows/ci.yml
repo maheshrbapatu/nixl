@@ -249,6 +249,7 @@ jobs:
   upload-x86-wheels:
     needs: build
     if: ${{ github.event.inputs.release_build == 'true' || startsWith(github.ref, 'refs/heads/release/') }}
+    environment: release   # manual-approval gate before publishing to Artifactory
     runs-on: ${{ vars.NIXL_RUNNER_PREFIX || 'prod' }}-nixl-builder-amd-v1
     timeout-minutes: 30
     env:
@@ -288,6 +289,7 @@ jobs:
   upload-arm-wheels:
     needs: build
     if: ${{ github.event.inputs.release_build == 'true' || startsWith(github.ref, 'refs/heads/release/') }}
+    environment: release   # manual-approval gate before publishing to Artifactory
     # amd runner: the jfrog-cli-v2-jf image is amd64-only. This job only uploads the
     # already-built arm wheel files (downloaded as artifacts), so the host arch is irrelevant.
     runs-on: ${{ vars.NIXL_RUNNER_PREFIX || 'prod' }}-nixl-builder-amd-v1
@@ -377,6 +379,8 @@ jobs:
       NSPECT_ID: NSPECT-WO64-8O3P
       NIXL_CI_REF: ${{ vars.NIXL_CI_REF || 'main' }}
       WHEEL_VERSION: ${{ needs.version.outputs.version }}
+      # security_scan dispatch input gates the wheel scan; defaults true on release/** pushes.
+      ENABLE_WHEEL_SCAN: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.security_scan == 'true' }}
     steps:
       - name: Trigger nixl-ci nSpect + scan pipeline
         run: |
@@ -396,7 +400,7 @@ jobs:
             --form "variables[RC_TAG]=${GITHUB_REF_NAME}" \
             --form "variables[GITHUB_RUN_ID]=${GITHUB_RUN_ID}" \
             --form "variables[COMMIT_SHA]=${GITHUB_SHA}" \
-            --form "variables[ENABLE_WHEEL_SCAN]=true" \
+            --form "variables[ENABLE_WHEEL_SCAN]=${ENABLE_WHEEL_SCAN}" \
             "${GITLAB_TRIGGER_URL}")
           PIPELINE_ID=$(echo "${RESPONSE}" | jq -r '.id // empty')
           PIPELINE_URL=$(echo "${RESPONSE}" | jq -r '.web_url // empty')
