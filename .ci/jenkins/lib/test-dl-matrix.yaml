@@ -124,10 +124,17 @@ steps:
       printf "rust\t.gitlab/test_rust.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
       printf "cpp\tUCX_IB_REG_METHODS=rcache .gitlab/test_cpp.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
       printf "nixlbench\tHAS_GPU=false .gitlab/test_nixlbench.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
+      # cpp is quarantined non-gating: it still runs and its real result is in the
+      # logs + JUnit, but a failure does not gate the build. Reason: on the Lyris
+      # GB200 node the container hits a GPU-IB/UCX gap ("accelerated IB support not
+      # found"; cuda get(multi) has no UCX protocol) - deterministic on Lyris and
+      # also flaky on dlcluster (ibv_reg_dmabuf_mr failed). TRACKED: remove
+      # "--allow-fail cpp" once the cluster/UCX GPUDirect path is fixed.
       TRIGGER_TOKEN=${LYRIS_TRIGGER_TOKEN} GITLAB_TOKEN=${LYRIS_API_TOKEN} \
       .ci/scripts/trigger_and_wait.sh \
         --ref ${LYRIS_PIPELINE_REF} \
         --partition ${LYRIS_PARTITION} \
         --image "${registry_host}#${ARTIFACTORY_PATH}/pr/${arch}/nixl-ci-dl-gpu-test-${ucx_version}:${BUILD_NUMBER}" \
         --test-cmds-file tc.txt \
+        --allow-fail cpp \
         --retries 2
