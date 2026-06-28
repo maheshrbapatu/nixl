@@ -38,7 +38,6 @@ kubernetes:
 
 credentials:
   - {credentialsId: 'svc-nixl-new-artifactory-token', usernameVariable: 'REPO_USER', passwordVariable: 'REPO_PASS'}
-  # TODO: create these Jenkins credentials before enabling the Lyris trigger
   - {credentialsId: 'lyris-trigger-token', type: string, variable: 'LYRIS_TRIGGER_TOKEN'}
   - {credentialsId: 'lyris-api-token', type: string, variable: 'LYRIS_API_TOKEN'}
 
@@ -114,22 +113,12 @@ steps:
     credentialsId: ['lyris-trigger-token', 'lyris-api-token']
     run: |
       set -x
-      # Write test-cmds file: one entry per line as "name<TAB>command".
-      # cpp: UCX_IB_REG_METHODS=rcache is inlined as a shell env-var prefix.
-      # nixlbench: HAS_GPU=false is inlined as a shell env-var prefix.
-      # NOTE: the original slurmCI steps set these via slurmEnv (per-run SLURM env injection).
-      # In the single-session Lyris model all four tests run in one srun; the inline
-      # prefix approach is equivalent but scopes the var to that command only.
+      # test-cmds: "name<TAB>command" per line; per-test env inlined as a prefix.
       printf "python\t.gitlab/test_python.sh ${NIXL_INSTALL_DIR}\n" > tc.txt
       printf "rust\t.gitlab/test_rust.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
       printf "cpp\tUCX_IB_REG_METHODS=rcache .gitlab/test_cpp.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
       printf "nixlbench\tHAS_GPU=false .gitlab/test_nixlbench.sh ${NIXL_INSTALL_DIR}\n" >> tc.txt
-      # cpp is quarantined non-gating: it still runs and its real result is in the
-      # logs + JUnit, but a failure does not gate the build. Reason: on the Lyris
-      # GB200 node the container hits a GPU-IB/UCX gap ("accelerated IB support not
-      # found"; cuda get(multi) has no UCX protocol) - deterministic on Lyris and
-      # also flaky on dlcluster (ibv_reg_dmabuf_mr failed). TRACKED: remove
-      # "--allow-fail cpp" once the cluster/UCX GPUDirect path is fixed.
+      # cpp quarantined non-gating: Lyris GPU-IB/UCX gap (tracked); drop --allow-fail when fixed.
       TRIGGER_TOKEN=${LYRIS_TRIGGER_TOKEN} GITLAB_TOKEN=${LYRIS_API_TOKEN} \
       .ci/scripts/trigger_and_wait.sh \
         --ref ${LYRIS_PIPELINE_REF} \
