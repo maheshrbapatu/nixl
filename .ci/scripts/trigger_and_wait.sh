@@ -3,11 +3,13 @@
 # Retries on infra-class outcomes (exit 90 / runner offline / queue timeout).
 set -uo pipefail
 API="https://gitlab-master.nvidia.com/api/v4/projects/231686"
-REF=""; PART=""; IMAGE=""; TCF=""; RETRIES=2
+REF=""; PART=""; IMAGE=""; TCF=""; RETRIES=2; ALLOW_FAIL=""
 while [ $# -gt 0 ]; do case "$1" in
   --ref) REF=$2; shift 2;; --partition) PART=$2; shift 2;;
   --image) IMAGE=$2; shift 2;; --test-cmds-file) TCF=$2; shift 2;;
-  --retries) RETRIES=$2; shift 2;; *) echo "bad arg $1" >&2; exit 2;; esac; done
+  --retries) RETRIES=$2; shift 2;;
+  --allow-fail) ALLOW_FAIL=$2; shift 2;;   # space-separated test names to quarantine (non-gating)
+  *) echo "bad arg $1" >&2; exit 2;; esac; done
 : "${TRIGGER_TOKEN:?}"; : "${GITLAB_TOKEN:?}"
 : "${REF:?}"; : "${PART:?}"; : "${IMAGE:?}"; : "${TCF:?}"
 TC=$(base64 -w0 < "$TCF" 2>/dev/null || base64 < "$TCF" | tr -d '\n')
@@ -17,7 +19,8 @@ while :; do
   attempt=$((attempt+1))
   PID=$(curl -sS -X POST -F "token=$TRIGGER_TOKEN" -F "ref=$REF" \
     -F "variables[PARTITION]=$PART" -F "variables[IMAGE]=$IMAGE" \
-    -F "variables[TEST_CMDS]=$TC" "$API/trigger/pipeline" \
+    -F "variables[TEST_CMDS]=$TC" -F "variables[ALLOW_FAIL]=$ALLOW_FAIL" \
+    "$API/trigger/pipeline" \
     | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
   echo "pipeline=$PID attempt=$attempt"
   # poll
