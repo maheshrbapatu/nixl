@@ -39,8 +39,8 @@ kubernetes:
 credentials:
   - {credentialsId: 'svc-nixl-new-artifactory-token', usernameVariable: 'REPO_USER', passwordVariable: 'REPO_PASS'}
   # TODO: create these Jenkins credentials before enabling the Lyris trigger
-  - {credentialsId: 'lyris-trigger-token', variable: 'LYRIS_TRIGGER_TOKEN'}
-  - {credentialsId: 'lyris-api-token', variable: 'LYRIS_API_TOKEN'}
+  - {credentialsId: 'lyris-trigger-token', type: string, variable: 'LYRIS_TRIGGER_TOKEN'}
+  - {credentialsId: 'lyris-api-token', type: string, variable: 'LYRIS_API_TOKEN'}
 
 env:
   ARTIFACTORY_PATH: /sw-nbu-swx-nixl-docker-local/ci
@@ -111,6 +111,7 @@ steps:
     containerSelector: "{name: 'build_helper_dl'}"
     timeout: "${TEST_TIMEOUT}"
     parallel: false
+    credentialsId: ['lyris-trigger-token', 'lyris-api-token']
     run: |
       set -x
       # Write test-cmds file: one entry per line as "name<TAB>command".
