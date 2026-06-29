@@ -53,7 +53,7 @@ gds_common_dep = declare_dependency(
     include_directories: gds_common_incs)
 
 gds_sources = ['gds_plugin.cpp', 'gds_batch_engine.cpp', 'gds_batch_engine.h']
-gds_deps = [gds_common_dep]
+gds_deps = [gds_common_dep, taskflow_proj, thread_dep]
 
 # "GDS" backend name entry point (cuFile batch engine).
 if enabled_plugins.get('GDS')
@@ -81,7 +81,9 @@ if enabled_plugins.get('GDS')
             )
         endif
     endif
-    gds_backend_interface = declare_dependency(link_with: gds_backend_lib)
+    gds_backend_interface = declare_dependency(
+        link_with: gds_backend_lib,
+        dependencies: [taskflow_proj, thread_dep])
 endif
 
 # "GDS_MT" backend name entry point (per-request TaskFlow strategy).

@@ -37,9 +37,14 @@ struct GdsXferReq {
     void *addr;
     size_t size;
     size_t file_offset;
+    size_t ptr_offset;
+    bool host_memory;
     CUfileHandle_t fh;
     CUfileOpcode_t op;
 };
+
+nixl_status_t
+runGdsCuFileOp(const GdsXferReq &req, const char *backend_name);
 
 // Abstract base for the GDS family of backends. It owns everything that is
 // identical between "GDS" and "GDS_MT": the cuFile driver lifecycle, memory and

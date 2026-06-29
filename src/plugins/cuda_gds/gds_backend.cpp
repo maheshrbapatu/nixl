@@ -14,6 +14,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <cerrno>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <system_error>
@@ -60,6 +62,32 @@ public:
 };
 
 } // namespace
+
+nixl_status_t
+runGdsCuFileOp(const GdsXferReq &req, const char *backend_name) {
+    ssize_t nbytes = 0;
+    if (req.op == CUFILE_READ) {
+        nbytes = cuFileRead(req.fh, req.addr, req.size, req.file_offset, req.ptr_offset);
+    } else if (req.op == CUFILE_WRITE) {
+        nbytes = cuFileWrite(req.fh, req.addr, req.size, req.file_offset, req.ptr_offset);
+    } else {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (nbytes < 0) {
+        NIXL_ERROR << backend_name << ": cuFile "
+                   << ((req.op == CUFILE_READ) ? "read" : "write")
+                   << " failed: " << strerror(errno);
+        return NIXL_ERR_BACKEND;
+    }
+    if (static_cast<size_t>(nbytes) != req.size) {
+        NIXL_ERROR << backend_name << ": short "
+                   << ((req.op == CUFILE_READ) ? "read: " : "write: ") << nbytes << " out of "
+                   << req.size << " bytes - address=" << req.addr;
+        return NIXL_ERR_BACKEND;
+    }
+    return NIXL_SUCCESS;
+}
 
 nixlGdsEngine::nixlGdsEngine(const nixlBackendInitParams *init_params)
     : nixlBackendEngine(init_params) {
@@ -178,6 +206,12 @@ nixlGdsEngine::prepXfer(const nixl_xfer_op_t &operation,
     }
 
     const bool is_local_file = (local.getType() == FILE_SEG);
+    const nixl_mem_t mem_type = is_local_file ? remote.getType() : local.getType();
+    if (mem_type != DRAM_SEG && mem_type != VRAM_SEG) {
+        NIXL_ERROR << "GDS: error: backend only supports I/O between memory (DRAM/VRAM_SEG) and "
+                      "files (FILE_SEG)";
+        return NIXL_ERR_INVALID_PARAM;
+    }
 
     std::vector<GdsXferReq> reqs;
     reqs.reserve(buf_cnt);
@@ -204,6 +238,8 @@ nixlGdsEngine::prepXfer(const nixl_xfer_op_t &operation,
         reqs.push_back(GdsXferReq{base_addr,
                                   mem_desc.len,
                                   (size_t)file_desc.addr,
+                                  0,
+                                  mem_type == DRAM_SEG,
                                   file_data->handle->cu_fhandle,
                                   (operation == NIXL_READ) ? CUFILE_READ : CUFILE_WRITE});
     }

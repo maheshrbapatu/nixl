@@ -17,11 +17,15 @@
 #ifndef __GDS_BATCH_ENGINE_H
 #define __GDS_BATCH_ENGINE_H
 
+#include <atomic>
+#include <future>
 #include <memory>
 #include <mutex>
 #include <vector>
 
 #include <cufile.h>
+#include <taskflow/core/executor.hpp>
+#include <taskflow/taskflow.hpp>
 
 #include "gds_backend.h"
 
@@ -65,15 +69,21 @@ private:
 
 class nixlGdsBatchReqH : public nixlBackendReqH {
 public:
-    ~nixlGdsBatchReqH() override = default;
+    ~nixlGdsBatchReqH() override;
 
     std::vector<GdsXferReq> request_list;
     std::vector<nixlGdsIOBatch *> batch_io_list;
+    tf::Taskflow host_taskflow;
+    std::future<void> host_transfer;
+    std::atomic<nixl_status_t> host_status{NIXL_SUCCESS};
+    bool host_memory = false;
     nixl_status_t overall_status = NIXL_SUCCESS;
 };
 
-// "GDS" backend: cuFile batch transfers. Large transfers are split by
-// max_request_size and submitted in batches of up to batch_limit entries.
+// "GDS" backend: cuFile VRAM batch transfers. DRAM requests use asynchronous
+// per-chunk cuFileRead/cuFileWrite tasks because the cuFile 1.18 host-memory
+// batch completion path is not reliable under polling. Large transfers are
+// split by max_request_size in either path.
 //
 // Inherits from nixlGdsEngine (see gds_backend.h): registerMem/deregisterMem,
 // queryMem, the cuFile driver lifecycle, and the prepXfer preamble (validation +
@@ -117,6 +127,7 @@ private:
     mutable std::mutex batch_pool_lock_;
     mutable std::vector<nixlGdsIOBatch *> batch_pool_;
     std::vector<std::unique_ptr<nixlGdsIOBatch>> batch_storage_;
+    std::unique_ptr<tf::Executor> executor_;
     unsigned int batch_pool_size_ = 0;
     unsigned int batch_limit_ = 0;
     unsigned int max_request_size_ = 0;

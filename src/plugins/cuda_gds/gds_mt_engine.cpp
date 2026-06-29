@@ -14,9 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-#include <cerrno>
 #include <chrono>
-#include <cstring>
 #include <thread>
 #include <utility>
 
@@ -37,31 +35,9 @@ getThreadCount(const nixlBackendInitParams *init_params) {
 
 void
 runCuFileOp(const GdsXferReq *req, std::atomic<nixl_status_t> *overall_status) {
-    ssize_t nbytes = 0;
-    if (req->op == CUFILE_READ) {
-        nbytes = cuFileRead(req->fh, req->addr, req->size, req->file_offset, 0);
-        if (nbytes < 0) {
-            NIXL_ERROR << "GDS_MT: cuFileRead failed: " << strerror(errno);
-            overall_status->store(NIXL_ERR_BACKEND);
-            return;
-        }
-    } else if (req->op == CUFILE_WRITE) {
-        nbytes = cuFileWrite(req->fh, req->addr, req->size, req->file_offset, 0);
-        if (nbytes < 0) {
-            NIXL_ERROR << "GDS_MT: cuFileWrite failed: " << strerror(errno);
-            overall_status->store(NIXL_ERR_BACKEND);
-            return;
-        }
-    } else {
-        overall_status->store(NIXL_ERR_INVALID_PARAM);
-        return;
-    }
-
-    if ((size_t)nbytes != req->size) {
-        NIXL_ERROR << "GDS_MT: error: short " << ((req->op == CUFILE_READ) ? "read: " : "write: ")
-                   << nbytes << " out of " << req->size << " bytes - address=" << req->addr;
-        overall_status->store(NIXL_ERR_BACKEND);
-        return;
+    const nixl_status_t status = runGdsCuFileOp(*req, "GDS_MT");
+    if (status != NIXL_SUCCESS) {
+        overall_status->store(status);
     }
 }
 } // namespace

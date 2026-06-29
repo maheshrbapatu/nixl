@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <limits>
 #include <stdexcept>
@@ -146,7 +147,8 @@ nixlGdsIOBatch::checkStatus() {
     for (unsigned int i = 0; i < nr; ++i) {
         const CUfileIOEvents_t &event = io_batch_events[i];
         if (event.status != CUFILE_COMPLETE || event.cookie == nullptr) {
-            NIXL_ERROR << "GDS batch entry failed with status " << event.status;
+            NIXL_ERROR << "GDS batch entry failed with status " << event.status
+                       << ", result " << static_cast<ssize_t>(event.ret);
             current_status = NIXL_ERR_BACKEND;
             return current_status;
         }
@@ -182,6 +184,12 @@ nixlGdsIOBatch::reset() {
     current_status = NIXL_ERR_NOT_POSTED;
 }
 
+nixlGdsBatchReqH::~nixlGdsBatchReqH() {
+    if (host_transfer.valid()) {
+        host_transfer.wait();
+    }
+}
+
 nixlGdsBatchEngine::nixlGdsBatchEngine(const nixlBackendInitParams *init_params)
     : nixlGdsEngine(init_params) {
     // Base ctor opened the cuFile driver; bail if that failed.
@@ -214,14 +222,19 @@ nixlGdsBatchEngine::nixlGdsBatchEngine(const nixlBackendInitParams *init_params)
             batch_pool_.push_back(batch.get());
             batch_storage_.push_back(std::move(batch));
         }
+        // PR2 keeps batch submission on the caller. This single persistent
+        // worker is only for asynchronous DRAM cuFileRead/cuFileWrite tasks.
+        executor_ = std::make_unique<tf::Executor>(1);
     }
     catch (const std::exception &e) {
         NIXL_ERROR << e.what();
+        executor_.reset();
         this->initErr = true;
     }
 }
 
 nixlGdsBatchEngine::~nixlGdsBatchEngine() {
+    executor_.reset();
     batch_pool_.clear();
     batch_storage_.clear();
 }
@@ -283,9 +296,11 @@ nixlGdsBatchEngine::finalizePrep(std::vector<GdsXferReq> &&reqs,
                 const size_t request_size = std::min(remaining_size, max_request_size);
 
                 GdsXferReq chunk;
-                chunk.addr = (char *)req.addr + current_offset;
+                chunk.addr = req.addr;
                 chunk.size = request_size;
                 chunk.file_offset = req.file_offset + current_offset;
+                chunk.ptr_offset = req.ptr_offset + current_offset;
+                chunk.host_memory = req.host_memory;
                 chunk.fh = req.fh;
                 chunk.op = req.op;
                 gds_handle->request_list.push_back(chunk);
@@ -294,6 +309,30 @@ nixlGdsBatchEngine::finalizePrep(std::vector<GdsXferReq> &&reqs,
                 current_offset += request_size;
             }
         }
+    }
+
+    gds_handle->host_memory = gds_handle->request_list.front().host_memory;
+    if (std::any_of(gds_handle->request_list.begin(),
+                    gds_handle->request_list.end(),
+                    [&](const GdsXferReq &req) {
+                        return req.host_memory != gds_handle->host_memory;
+                    })) {
+        return NIXL_ERR_INVALID_PARAM;
+    }
+
+    if (gds_handle->host_memory) {
+        for (GdsXferReq &req : gds_handle->request_list) {
+            GdsXferReq *captured_req = &req;
+            gds_handle->host_taskflow.emplace(
+                [captured_req, status = &gds_handle->host_status]() {
+                    const nixl_status_t result = runGdsCuFileOp(*captured_req, "GDS");
+                    if (result != NIXL_SUCCESS) {
+                        status->store(result);
+                    }
+                });
+        }
+        handle = gds_handle.release();
+        return NIXL_SUCCESS;
     }
 
     const size_t request_count = gds_handle->request_list.size();
@@ -328,8 +367,8 @@ nixlGdsBatchEngine::createAndSubmitBatch(const std::vector<GdsXferReq> &requests
             return NIXL_ERR_INVALID_PARAM;
         }
 
-        nixl_status_t status =
-            batch->addToBatch(req.fh, req.addr, req.size, req.file_offset, 0, req.op);
+        nixl_status_t status = batch->addToBatch(
+            req.fh, req.addr, req.size, req.file_offset, req.ptr_offset, req.op);
         if (status != NIXL_SUCCESS) {
             returnBatchToPool(batch);
             return NIXL_ERR_INVALID_PARAM;
@@ -384,6 +423,25 @@ nixlGdsBatchEngine::postXfer(const nixl_xfer_op_t &operation,
     if (!gds_handle->batch_io_list.empty()) {
         return NIXL_ERR_REPOST_ACTIVE;
     }
+    if (!executor_) {
+        return NIXL_ERR_BACKEND;
+    }
+
+    if (gds_handle->host_memory) {
+        if (gds_handle->host_transfer.valid()) {
+            return NIXL_ERR_REPOST_ACTIVE;
+        }
+        gds_handle->host_status.store(NIXL_SUCCESS);
+        try {
+            gds_handle->host_transfer = executor_->run(gds_handle->host_taskflow);
+        }
+        catch (const std::exception &e) {
+            NIXL_ERROR << "GDS: failed to run host-memory transfer: " << e.what();
+            gds_handle->host_status.store(NIXL_ERR_BACKEND);
+            return NIXL_ERR_BACKEND;
+        }
+        return NIXL_IN_PROG;
+    }
 
     const auto &request_list = gds_handle->request_list;
     const size_t batch_count = ceilDiv(request_list.size(), batch_limit_);
@@ -418,6 +476,25 @@ nixlGdsBatchEngine::postXfer(const nixl_xfer_op_t &operation,
 nixl_status_t
 nixlGdsBatchEngine::checkXfer(nixlBackendReqH *handle) const {
     auto *gds_handle = static_cast<nixlGdsBatchReqH *>(handle);
+
+    if (gds_handle->host_memory) {
+        if (!gds_handle->host_transfer.valid()) {
+            return gds_handle->host_status.load();
+        }
+        if (gds_handle->host_transfer.wait_for(std::chrono::seconds(0)) !=
+            std::future_status::ready) {
+            return NIXL_IN_PROG;
+        }
+        try {
+            gds_handle->host_transfer.get();
+        }
+        catch (const std::exception &e) {
+            NIXL_ERROR << "GDS: host-memory transfer failed: " << e.what();
+            gds_handle->host_status.store(NIXL_ERR_BACKEND);
+            return NIXL_ERR_BACKEND;
+        }
+        return gds_handle->host_status.load();
+    }
 
     if (gds_handle->batch_io_list.empty()) {
         return gds_handle->overall_status;

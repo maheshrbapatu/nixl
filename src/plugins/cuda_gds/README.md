@@ -22,7 +22,10 @@ NIXL. It provides two backend names that share a common base engine
 (`nixlGdsEngine`, which owns registration, query, the cuFile driver lifecycle
 and transfer validation):
 
-- `GDS`: cuFile batch transfers (`nixlGdsBatchEngine`).
+- `GDS`: VRAM cuFile batch transfers (`nixlGdsBatchEngine`). DRAM transfers
+  use asynchronous per-chunk `cuFileRead`/`cuFileWrite` tasks on a persistent
+  executor; this avoids unreliable host-memory batch completion observed with
+  cuFile 1.18 while keeping the optimized GPU path nonblocking.
 - `GDS_MT`: multi-threaded transfers via TaskFlow (`nixlGdsMtEngine`). TaskFlow
   issues one `cuFileRead` or `cuFileWrite` per prepared request.
 

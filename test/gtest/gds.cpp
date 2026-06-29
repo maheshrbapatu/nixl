@@ -243,6 +243,20 @@ TEST_P(GdsBackend, DramFileRoundTrip) {
     EXPECT_TRUE(dramRoundTrip(agent, self, be, 1 * 1024 * 1024));
 }
 
+// Crosses the GDS default max_request_size (16 MB) so the transfer must split.
+TEST_P(GdsBackend, LargeDramFileRoundTripCrossesMaxRequestSize) {
+    nixlAgentConfig cfg;
+    const std::string self = "gds_large_rt_" + GetParam();
+    nixlAgent agent(self, cfg);
+
+    nixlBackendH *be = nullptr;
+    if (tryCreate(agent, GetParam(), be) != NIXL_SUCCESS || be == nullptr) {
+        GTEST_SKIP() << GetParam() << " backend unavailable (no cuFile/GDS)";
+    }
+
+    EXPECT_TRUE(dramRoundTrip(agent, self, be, 32 * 1024 * 1024));
+}
+
 // ---------------------------------------------------------------------------
 // Group C: validation (hardware-gated - needs a created backend).
 // ---------------------------------------------------------------------------
