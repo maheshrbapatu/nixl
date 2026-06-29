@@ -36,8 +36,10 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <unistd.h>
 
+#include <cuda_runtime.h>
 #include <gtest/gtest.h>
 
 #include "common.h"
@@ -53,6 +55,35 @@ constexpr unsigned char kPattern = 0xAB;
 bool
 hasMem(const nixl_mem_list_t &mems, nixl_mem_t m) {
     return std::find(mems.begin(), mems.end(), m) != mems.end();
+}
+
+std::vector<unsigned int>
+allowedCpuIds() {
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+        return {};
+    }
+
+    std::vector<unsigned int> result;
+    for (unsigned int cpu = 0; cpu < static_cast<unsigned int>(CPU_SETSIZE); ++cpu) {
+        if (CPU_ISSET(static_cast<int>(cpu), &allowed)) {
+            result.push_back(cpu);
+        }
+    }
+    return result;
+}
+
+std::string
+cpuList(const std::vector<unsigned int> &cpus, size_t count) {
+    std::string result;
+    for (size_t i = 0; i < count; ++i) {
+        if (!result.empty()) {
+            result += ',';
+        }
+        result += std::to_string(cpus[i]);
+    }
+    return result;
 }
 
 std::string
@@ -194,7 +225,7 @@ TEST_P(GdsBackend, AdvertisesDramVramFileMemTypes) {
     EXPECT_TRUE(hasMem(mems, FILE_SEG));
 }
 
-TEST(GdsBatchOptions, AdvertisesBatchConfiguration) {
+TEST(GdsBatchOptions, AdvertisesWorkerConfiguration) {
     nixlAgentConfig cfg;
     nixlAgent agent("gds_batch_options", cfg);
 
@@ -207,8 +238,8 @@ TEST(GdsBatchOptions, AdvertisesBatchConfiguration) {
     EXPECT_EQ(params["batch_pool_size"], "16");
     EXPECT_EQ(params["batch_limit"], "128");
     EXPECT_EQ(params["max_request_size"], "16777216");
-    EXPECT_EQ(params.find("submit_threads"), params.end());
-    EXPECT_EQ(params.find("submit_cpus"), params.end());
+    EXPECT_EQ(params["submit_threads"], "4");
+    EXPECT_EQ(params["submit_cpus"], "");
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +261,54 @@ TEST_P(GdsBackend, CreateReportsRequestedType) {
     EXPECT_TRUE(hasMem(mems, FILE_SEG));
 }
 
+TEST(GdsBatchConfig, RejectsInvalidWorkerConfiguration) {
+    {
+        nixlAgentConfig cfg;
+        nixlAgent probe("gds_config_probe", cfg);
+        nixlBackendH *be = nullptr;
+        if (tryCreate(probe, "GDS", be) != NIXL_SUCCESS || be == nullptr) {
+            GTEST_SKIP() << "GDS backend unavailable (no cuFile/GDS)";
+        }
+    }
+
+    const std::vector<unsigned int> cpus = allowedCpuIds();
+    ASSERT_FALSE(cpus.empty());
+
+    auto expectCreateFailure = [](const std::string &agent_name,
+                                  nixl_b_params_t params,
+                                  const std::string &expected_log) {
+        nixlAgentConfig cfg;
+        nixlAgent agent(agent_name, cfg);
+        nixlBackendH *be = nullptr;
+        const gtest::LogIgnoreGuard config_error(expected_log);
+        const gtest::LogIgnoreGuard init_error(
+            "createBackend: backend initialization error for 'GDS'");
+        EXPECT_NE(agent.createBackend("GDS", params, be), NIXL_SUCCESS);
+        EXPECT_EQ(config_error.getIgnoredCount(), 1);
+        EXPECT_EQ(init_error.getIgnoredCount(), 1);
+    };
+
+    expectCreateFailure("gds_bad_pool",
+                        {{"submit_threads", "4"}, {"batch_pool_size", "3"}},
+                        "GDS: batch_pool_size must be at least submit_threads");
+    expectCreateFailure(
+        "gds_zero_workers",
+        {{"submit_threads", "0"}},
+        "GDS: batch_pool_size, batch_limit, max_request_size, and submit_threads must be greater "
+        "than zero");
+    expectCreateFailure("gds_bad_cpu_count",
+                        {{"submit_threads", "4"},
+                         {"submit_cpus", std::to_string(cpus.front())}},
+                        "GDS: submit_cpus must contain one CPU ID per submit thread");
+    const std::string duplicate_cpu = std::to_string(cpus.front());
+    expectCreateFailure("gds_duplicate_cpus",
+                        {{"submit_threads", "4"},
+                         {"submit_cpus",
+                          duplicate_cpu + "," + duplicate_cpu + "," + duplicate_cpu + "," +
+                              duplicate_cpu}},
+                        "GDS: submit_cpus must not contain duplicate CPU IDs");
+}
+
 TEST_P(GdsBackend, DramFileRoundTrip) {
     nixlAgentConfig cfg;
     const std::string self = "gds_dram_rt_" + GetParam();
@@ -243,7 +322,7 @@ TEST_P(GdsBackend, DramFileRoundTrip) {
     EXPECT_TRUE(dramRoundTrip(agent, self, be, 1 * 1024 * 1024));
 }
 
-// Crosses the GDS default max_request_size (16 MB) so the transfer must split.
+// Crosses the GDS default max_request_size (16 MB) so the batch path must split.
 TEST_P(GdsBackend, LargeDramFileRoundTripCrossesMaxRequestSize) {
     nixlAgentConfig cfg;
     const std::string self = "gds_large_rt_" + GetParam();
@@ -255,6 +334,83 @@ TEST_P(GdsBackend, LargeDramFileRoundTripCrossesMaxRequestSize) {
     }
 
     EXPECT_TRUE(dramRoundTrip(agent, self, be, 32 * 1024 * 1024));
+}
+
+TEST(GdsBatchWorkers, FourPinnedWorkersRoundTripFourDescriptors) {
+    constexpr size_t chunk_count = 4;
+    constexpr size_t chunk_size = 20 * 1024 * 1024;
+    constexpr size_t total_size = chunk_count * chunk_size;
+
+    const std::vector<unsigned int> cpus = allowedCpuIds();
+    if (cpus.size() < chunk_count) {
+        GTEST_SKIP() << "Four allowed CPUs are required for the affinity test";
+    }
+
+    {
+        nixlAgentConfig probe_cfg;
+        nixlAgent probe("gds_workers_probe", probe_cfg);
+        nixlBackendH *probe_backend = nullptr;
+        if (tryCreate(probe, "GDS", probe_backend) != NIXL_SUCCESS ||
+            probe_backend == nullptr) {
+            GTEST_SKIP() << "GDS backend unavailable (no cuFile/GDS)";
+        }
+    }
+
+    nixlAgentConfig cfg;
+    const std::string self = "gds_four_workers";
+    nixlAgent agent(self, cfg);
+    nixl_b_params_t params{{"submit_threads", "4"},
+                           {"submit_cpus", cpuList(cpus, chunk_count)}};
+    nixlBackendH *be = nullptr;
+    ASSERT_EQ(agent.createBackend("GDS", params, be), NIXL_SUCCESS);
+    ASSERT_NE(be, nullptr);
+
+    const std::string path = makeSizedFile("nixl_gds_gtest_workers.bin", total_size);
+    const int fd = ::open(path.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+
+    void *buffer = nullptr;
+    ASSERT_EQ(cudaMalloc(&buffer, total_size), cudaSuccess);
+
+    nixl_reg_dlist_t files(FILE_SEG);
+    nixl_reg_dlist_t memory(VRAM_SEG);
+    for (size_t i = 0; i < chunk_count; ++i) {
+        nixlBlobDesc file_desc;
+        file_desc.addr = i * chunk_size;
+        file_desc.len = chunk_size;
+        file_desc.devId = static_cast<uint64_t>(fd);
+        files.addDesc(file_desc);
+
+        nixlBlobDesc memory_desc;
+        memory_desc.addr = reinterpret_cast<uintptr_t>(buffer) + i * chunk_size;
+        memory_desc.len = chunk_size;
+        memory_desc.devId = 0;
+        memory.addDesc(memory_desc);
+    }
+
+    nixl_opt_args_t options;
+    options.backends = {be};
+    ASSERT_EQ(agent.registerMem(files, &options), NIXL_SUCCESS);
+    ASSERT_EQ(agent.registerMem(memory, &options), NIXL_SUCCESS);
+
+    ASSERT_EQ(cudaMemset(buffer, kPattern, total_size), cudaSuccess);
+    nixl_xfer_dlist_t memory_xfer = memory.trim();
+    nixl_xfer_dlist_t file_xfer = files.trim();
+    ASSERT_EQ(runTransfer(agent, self, be, NIXL_WRITE, memory_xfer, file_xfer), NIXL_SUCCESS);
+
+    ASSERT_EQ(cudaMemset(buffer, 0, total_size), cudaSuccess);
+    ASSERT_EQ(runTransfer(agent, self, be, NIXL_READ, memory_xfer, file_xfer), NIXL_SUCCESS);
+    std::vector<unsigned char> result(total_size);
+    ASSERT_EQ(cudaMemcpy(result.data(), buffer, total_size, cudaMemcpyDeviceToHost), cudaSuccess);
+    EXPECT_TRUE(std::all_of(result.begin(), result.end(), [](unsigned char value) {
+        return value == kPattern;
+    }));
+
+    EXPECT_EQ(agent.deregisterMem(memory, &options), NIXL_SUCCESS);
+    EXPECT_EQ(agent.deregisterMem(files, &options), NIXL_SUCCESS);
+    EXPECT_EQ(cudaFree(buffer), cudaSuccess);
+    ::close(fd);
+    std::filesystem::remove(path);
 }
 
 // ---------------------------------------------------------------------------

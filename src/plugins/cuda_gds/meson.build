@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Unified GDS plugin: the "GDS" batch API and "GDS_MT" per-request TaskFlow
-# backends share one abstract base engine (nixlGdsEngine), compiled once into
-# gds_common_lib. Each backend name builds a thin entry point plus its concrete
-# engine subclass.
+# Unified GDS plugin: the "GDS" (multi-threaded cuFile batch API) and "GDS_MT"
+# (multi-threaded per-request TaskFlow) backends share one abstract base engine
+# (nixlGdsEngine), compiled once into gds_common_lib. Each backend name builds a
+# thin entry point plus its concrete engine subclass.
 
 gds_path = get_option('gds_path')
 if gds_path != ''
@@ -55,7 +55,7 @@ gds_common_dep = declare_dependency(
 gds_sources = ['gds_plugin.cpp', 'gds_batch_engine.cpp', 'gds_batch_engine.h']
 gds_deps = [gds_common_dep, taskflow_proj, thread_dep]
 
-# "GDS" backend name entry point (cuFile batch engine).
+# "GDS" backend name entry point (multi-threaded cuFile batch engine).
 if enabled_plugins.get('GDS')
     if 'GDS' in static_plugins
         gds_backend_lib = static_library('GDS',

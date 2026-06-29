@@ -15,11 +15,24 @@
  * limitations under the License.
  */
 #include <algorithm>
+#include <atomic>
+#include <barrier>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <cstring>
 #include <exception>
+#include <latch>
 #include <limits>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 #include <utility>
+
+#include <pthread.h>
+#include <sched.h>
+
+#include <cuda_runtime.h>
 
 #include "common/backend.h"
 #include "common/nixl_log.h"
@@ -32,11 +45,127 @@ constexpr unsigned DEFAULT_BATCH_LIMIT = 128;
 constexpr unsigned DEFAULT_MAX_REQUEST_SIZE = 16 * 1024 * 1024; // 16MB
 /** Create a batch pool of size 16 */
 constexpr unsigned DEFAULT_BATCH_POOL_SIZE = 16;
+/** Submit batches from four persistent workers by default. */
+constexpr unsigned DEFAULT_SUBMIT_THREADS = 4;
 
 size_t
 ceilDiv(size_t value, size_t divisor) {
     return (value / divisor) + ((value % divisor) != 0);
 }
+
+size_t
+getBatchCount(size_t request_count, size_t batch_limit, size_t submit_threads) {
+    return std::max(ceilDiv(request_count, batch_limit),
+                    std::min(request_count, submit_threads));
+}
+
+std::string_view
+trim(std::string_view value) {
+    constexpr std::string_view whitespace = " \t\n\r";
+    const size_t first = value.find_first_not_of(whitespace);
+    if (first == std::string_view::npos) {
+        return {};
+    }
+    const size_t last = value.find_last_not_of(whitespace);
+    return value.substr(first, last - first + 1);
+}
+
+std::vector<unsigned int>
+parseSubmitCpus(const std::string &value, unsigned int submit_threads) {
+    std::vector<unsigned int> cpus;
+    if (trim(value).empty()) {
+        return cpus;
+    }
+
+    cpu_set_t allowed_cpus;
+    CPU_ZERO(&allowed_cpus);
+    if (sched_getaffinity(0, sizeof(allowed_cpus), &allowed_cpus) != 0) {
+        throw std::system_error(errno, std::generic_category(), "sched_getaffinity");
+    }
+
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t comma = value.find(',', start);
+        const size_t end = (comma == std::string::npos) ? value.size() : comma;
+        const std::string_view token = trim(std::string_view(value).substr(start, end - start));
+        if (token.empty()) {
+            throw std::invalid_argument("GDS: submit_cpus contains an empty CPU ID");
+        }
+
+        unsigned int cpu = 0;
+        const auto [ptr, error] = std::from_chars(token.data(), token.data() + token.size(), cpu);
+        if (error != std::errc() || ptr != token.data() + token.size()) {
+            throw std::invalid_argument("GDS: submit_cpus must be comma-separated CPU IDs");
+        }
+        if (cpu >= CPU_SETSIZE || !CPU_ISSET(static_cast<int>(cpu), &allowed_cpus)) {
+            throw std::invalid_argument("GDS: submit_cpus contains a CPU unavailable to this process");
+        }
+        if (std::find(cpus.begin(), cpus.end(), cpu) != cpus.end()) {
+            throw std::invalid_argument("GDS: submit_cpus must not contain duplicate CPU IDs");
+        }
+        cpus.push_back(cpu);
+
+        if (comma == std::string::npos) {
+            break;
+        }
+        start = comma + 1;
+    }
+
+    if (cpus.size() != submit_threads) {
+        throw std::invalid_argument("GDS: submit_cpus must contain one CPU ID per submit thread");
+    }
+
+    // TODO: Select CPUs automatically from the backing devices' blk-mq CPU
+    // maps and NUMA topology. This must account for dm/md and multi-device
+    // filesystems before it can safely replace explicit submit_cpus.
+    return cpus;
+}
+
+class GdsWorkerAffinity : public tf::WorkerInterface {
+public:
+    GdsWorkerAffinity(std::vector<unsigned int> cpus, unsigned int worker_count)
+        : cpus_(std::move(cpus)),
+          started_(static_cast<std::ptrdiff_t>(worker_count)) {}
+
+    void
+    scheduler_prologue(tf::Worker &worker) override {
+        const cudaError_t cuda_error = cudaSetDevice(0);
+        if (cuda_error != cudaSuccess) {
+            int expected = cudaSuccess;
+            cuda_error_.compare_exchange_strong(expected, cuda_error);
+        }
+
+        int affinity_error = 0;
+        if (!cpus_.empty()) {
+            cpu_set_t cpu_set;
+            CPU_ZERO(&cpu_set);
+            CPU_SET(static_cast<int>(cpus_[worker.id()]), &cpu_set);
+            affinity_error = pthread_setaffinity_np(
+                worker.thread().native_handle(), sizeof(cpu_set), &cpu_set);
+        }
+        if (affinity_error != 0) {
+            int expected = 0;
+            affinity_error_.compare_exchange_strong(expected, affinity_error);
+        }
+        started_.count_down();
+    }
+
+    void
+    scheduler_epilogue(tf::Worker &, std::exception_ptr) override {}
+
+    int
+    waitForStartup(cudaError_t &cuda_error) {
+        started_.wait();
+        cuda_error = static_cast<cudaError_t>(cuda_error_.load());
+        return affinity_error_.load();
+    }
+
+private:
+    const std::vector<unsigned int> cpus_;
+    std::latch started_;
+    std::atomic<int> affinity_error_{0};
+    std::atomic<int> cuda_error_{cudaSuccess};
+};
 } // namespace
 
 nixlGdsIOBatch::nixlGdsIOBatch(unsigned int size)
@@ -205,12 +334,24 @@ nixlGdsBatchEngine::nixlGdsBatchEngine(const nixlBackendInitParams *init_params)
             nixl::getBackendParamDefaulted(custom_params, "batch_limit", DEFAULT_BATCH_LIMIT);
         max_request_size_ = nixl::getBackendParamDefaulted(
             custom_params, "max_request_size", DEFAULT_MAX_REQUEST_SIZE);
+        submit_threads_ =
+            nixl::getBackendParamDefaulted(custom_params, "submit_threads", DEFAULT_SUBMIT_THREADS);
 
-        if (batch_pool_size_ == 0 || batch_limit_ == 0 || max_request_size_ == 0) {
+        if (batch_pool_size_ == 0 || batch_limit_ == 0 || max_request_size_ == 0 ||
+            submit_threads_ == 0) {
             throw std::invalid_argument(
-                "GDS: batch_pool_size, batch_limit, and max_request_size must be greater than "
-                "zero");
+                "GDS: batch_pool_size, batch_limit, max_request_size, and submit_threads "
+                "must be greater than zero");
         }
+        if (batch_pool_size_ < submit_threads_) {
+            throw std::invalid_argument(
+                "GDS: batch_pool_size must be at least submit_threads");
+        }
+
+        const std::string submit_cpu_config =
+            nixl::getBackendParamDefaulted(custom_params, "submit_cpus", std::string());
+        const std::vector<unsigned int> submit_cpus =
+            parseSubmitCpus(submit_cpu_config, submit_threads_);
 
         batch_pool_.reserve(batch_pool_size_);
         batch_storage_.reserve(batch_pool_size_);
@@ -222,9 +363,23 @@ nixlGdsBatchEngine::nixlGdsBatchEngine(const nixlBackendInitParams *init_params)
             batch_pool_.push_back(batch.get());
             batch_storage_.push_back(std::move(batch));
         }
-        // PR2 keeps batch submission on the caller. This single persistent
-        // worker is only for asynchronous DRAM cuFileRead/cuFileWrite tasks.
-        executor_ = std::make_unique<tf::Executor>(1);
+
+        auto worker_affinity =
+            std::make_shared<GdsWorkerAffinity>(submit_cpus, submit_threads_);
+        executor_ = std::make_unique<tf::Executor>(submit_threads_, worker_affinity);
+        cudaError_t cuda_error = cudaSuccess;
+        const int affinity_error = worker_affinity->waitForStartup(cuda_error);
+        if (cuda_error != cudaSuccess) {
+            throw std::runtime_error(std::string("GDS worker CUDA initialization: ") +
+                                     cudaGetErrorString(cuda_error));
+        }
+        if (affinity_error != 0) {
+            throw std::system_error(
+                affinity_error, std::generic_category(), "GDS worker CPU affinity");
+        }
+
+        NIXL_DEBUG << "GDS: submit threads=" << submit_threads_
+                   << (submit_cpus.empty() ? " (unpinned)" : " (CPU-pinned)");
     }
     catch (const std::exception &e) {
         NIXL_ERROR << e.what();
@@ -336,7 +491,7 @@ nixlGdsBatchEngine::finalizePrep(std::vector<GdsXferReq> &&reqs,
     }
 
     const size_t request_count = gds_handle->request_list.size();
-    const size_t batch_count = ceilDiv(request_count, batch_limit_);
+    const size_t batch_count = getBatchCount(request_count, batch_limit_, submit_threads_);
     if (batch_count > batch_pool_size_) {
         NIXL_ERROR << "GDS: transfer requires " << batch_count << " batches but the pool has "
                    << batch_pool_size_;
@@ -367,8 +522,13 @@ nixlGdsBatchEngine::createAndSubmitBatch(const std::vector<GdsXferReq> &requests
             return NIXL_ERR_INVALID_PARAM;
         }
 
-        nixl_status_t status = batch->addToBatch(
-            req.fh, req.addr, req.size, req.file_offset, req.ptr_offset, req.op);
+        nixl_status_t status =
+            batch->addToBatch(req.fh,
+                              req.addr,
+                              req.size,
+                              req.file_offset,
+                              req.ptr_offset,
+                              req.op);
         if (status != NIXL_SUCCESS) {
             returnBatchToPool(batch);
             return NIXL_ERR_INVALID_PARAM;
@@ -444,7 +604,7 @@ nixlGdsBatchEngine::postXfer(const nixl_xfer_op_t &operation,
     }
 
     const auto &request_list = gds_handle->request_list;
-    const size_t batch_count = ceilDiv(request_list.size(), batch_limit_);
+    const size_t batch_count = getBatchCount(request_list.size(), batch_limit_, submit_threads_);
     if (batch_count > batch_pool_size_) {
         return NIXL_ERR_BACKEND;
     }
@@ -452,22 +612,71 @@ nixlGdsBatchEngine::postXfer(const nixl_xfer_op_t &operation,
     gds_handle->overall_status = NIXL_SUCCESS;
     gds_handle->batch_io_list.assign(batch_count, nullptr);
 
+    std::atomic<nixl_status_t> first_error{NIXL_SUCCESS};
+    const size_t requests_per_batch = request_list.size() / batch_count;
+    const size_t batches_with_extra_request = request_list.size() % batch_count;
+    const size_t active_workers = std::min(batch_count, static_cast<size_t>(submit_threads_));
+    std::vector<size_t> batch_starts(batch_count);
+    std::vector<size_t> batch_sizes(batch_count);
     size_t current_req = 0;
-    for (size_t batch_index = 0; batch_index < batch_count; ++batch_index) {
-        const size_t batch_size = std::min(request_list.size() - current_req,
-                                           static_cast<size_t>(batch_limit_));
-        const nixl_status_t status = createAndSubmitBatch(request_list,
-                                                          current_req,
-                                                          batch_size,
-                                                          gds_handle->batch_io_list[batch_index]);
-        if (status != NIXL_SUCCESS) {
-            gds_handle->overall_status = status;
-            if (cancelAndReclaimBatches(gds_handle->batch_io_list) != NIXL_SUCCESS) {
-                return NIXL_ERR_BACKEND;
-            }
-            return status;
+    for (size_t i = 0; i < batch_count; ++i) {
+        batch_starts[i] = current_req;
+        batch_sizes[i] = requests_per_batch + (i < batches_with_extra_request ? 1 : 0);
+        current_req += batch_sizes[i];
+    }
+
+    // Only one barrier-backed submission graph may run at a time. This keeps
+    // concurrent transfers from occupying a subset of workers in different
+    // barriers and deadlocking the executor.
+    const std::lock_guard<std::mutex> dispatch_lock(submit_dispatch_lock_);
+    std::barrier submission_start(static_cast<std::ptrdiff_t>(active_workers));
+    tf::Taskflow submission_flow;
+
+    try {
+        for (size_t worker = 0; worker < active_workers; ++worker) {
+            submission_flow.emplace([&, worker]() {
+                // Blocking here forces each lane onto a distinct executor
+                // worker, whose CPU affinity was set at executor startup.
+                submission_start.arrive_and_wait();
+
+                for (size_t batch_index = worker; batch_index < batch_count;
+                     batch_index += active_workers) {
+                    nixl_status_t status = NIXL_ERR_BACKEND;
+                    try {
+                        status = createAndSubmitBatch(request_list,
+                                                      batch_starts[batch_index],
+                                                      batch_sizes[batch_index],
+                                                      gds_handle->batch_io_list[batch_index]);
+                    }
+                    catch (const std::exception &e) {
+                        NIXL_ERROR << "GDS: batch submission worker failed: " << e.what();
+                    }
+                    catch (...) {
+                        NIXL_ERROR
+                            << "GDS: batch submission worker failed with an unknown exception";
+                    }
+
+                    if (status != NIXL_SUCCESS) {
+                        nixl_status_t expected = NIXL_SUCCESS;
+                        first_error.compare_exchange_strong(expected, status);
+                    }
+                }
+            });
         }
-        current_req += batch_size;
+        executor_->run(submission_flow).get();
+    }
+    catch (const std::exception &e) {
+        NIXL_ERROR << "GDS: failed to run batch submission graph: " << e.what();
+        first_error.store(NIXL_ERR_BACKEND);
+    }
+
+    const nixl_status_t submit_status = first_error.load();
+    if (submit_status != NIXL_SUCCESS) {
+        gds_handle->overall_status = submit_status;
+        if (cancelAndReclaimBatches(gds_handle->batch_io_list) != NIXL_SUCCESS) {
+            return NIXL_ERR_BACKEND;
+        }
+        return submit_status;
     }
 
     return NIXL_IN_PROG;

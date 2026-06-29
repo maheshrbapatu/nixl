@@ -21,9 +21,10 @@
 #include "common/nixl_log.h"
 #include "gds_batch_engine.h"
 
-// The plugin struct is hand-written (rather than
-// nixlBackendPluginCreator<...>) so that, in static builds, GDS and GDS_MT do
-// not share a template's function-local static plugin instance.
+// "GDS" backend: multi-threaded cuFile batch API. The plugin struct is
+// hand-written (rather than nixlBackendPluginCreator<...>) so that, in static
+// builds, GDS and GDS_MT do not share a template's function-local static plugin
+// instance - they are distinct internal-linkage objects.
 namespace {
 
 nixlBackendEngine *
@@ -46,7 +47,9 @@ nixl_b_params_t
 getGdsBackendOptions() {
     return {{"batch_pool_size", "16"},
             {"batch_limit", "128"},
-            {"max_request_size", "16777216"}};
+            {"max_request_size", "16777216"},
+            {"submit_threads", "4"},
+            {"submit_cpus", ""}};
 }
 
 nixlBackendPlugin gds_plugin = {NIXL_PLUGIN_API_VERSION,

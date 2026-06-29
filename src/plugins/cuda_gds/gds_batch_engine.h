@@ -80,10 +80,11 @@ public:
     nixl_status_t overall_status = NIXL_SUCCESS;
 };
 
-// "GDS" backend: cuFile VRAM batch transfers. DRAM requests use asynchronous
-// per-chunk cuFileRead/cuFileWrite tasks because the cuFile 1.18 host-memory
-// batch completion path is not reliable under polling. Large transfers are
-// split by max_request_size in either path.
+// "GDS" backend: cuFile VRAM batches submitted by a fixed worker pool. DRAM
+// requests use asynchronous per-chunk cuFileRead/cuFileWrite tasks because the
+// cuFile 1.18 host-memory batch completion path is not reliable under polling.
+// Large transfers are split by max_request_size in either path; VRAM chunks are
+// spread across up to submit_threads batch-submission workers.
 //
 // Inherits from nixlGdsEngine (see gds_backend.h): registerMem/deregisterMem,
 // queryMem, the cuFile driver lifecycle, and the prepXfer preamble (validation +
@@ -125,12 +126,14 @@ private:
     cancelAndReclaimBatches(std::vector<nixlGdsIOBatch *> &batch_list) const;
 
     mutable std::mutex batch_pool_lock_;
+    mutable std::mutex submit_dispatch_lock_;
     mutable std::vector<nixlGdsIOBatch *> batch_pool_;
     std::vector<std::unique_ptr<nixlGdsIOBatch>> batch_storage_;
     std::unique_ptr<tf::Executor> executor_;
     unsigned int batch_pool_size_ = 0;
     unsigned int batch_limit_ = 0;
     unsigned int max_request_size_ = 0;
+    unsigned int submit_threads_ = 0;
 };
 
 #endif // __GDS_BATCH_ENGINE_H

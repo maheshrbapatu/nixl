@@ -22,23 +22,46 @@ NIXL. It provides two backend names that share a common base engine
 (`nixlGdsEngine`, which owns registration, query, the cuFile driver lifecycle
 and transfer validation):
 
-- `GDS`: VRAM cuFile batch transfers (`nixlGdsBatchEngine`). DRAM transfers
-  use asynchronous per-chunk `cuFileRead`/`cuFileWrite` tasks on a persistent
-  executor; this avoids unreliable host-memory batch completion observed with
-  cuFile 1.18 while keeping the optimized GPU path nonblocking.
+- `GDS`: VRAM cuFile batch transfers spread across persistent TaskFlow workers
+  (`nixlGdsBatchEngine`). DRAM transfers use asynchronous per-chunk
+  `cuFileRead`/`cuFileWrite` tasks on the same executor; this avoids unreliable
+  host-memory batch completion observed with cuFile 1.18 while keeping the
+  optimized GPU path nonblocking.
 - `GDS_MT`: multi-threaded transfers via TaskFlow (`nixlGdsMtEngine`). TaskFlow
   issues one `cuFileRead` or `cuFileWrite` per prepared request.
 
 The two backends use the same cuFile driver and therefore cannot be created
 simultaneously within a single agent.
 
-## GDS batch configuration
+## GDS batch worker configuration
 
 | Parameter | Default | Description |
 | --- | --- | --- |
-| `batch_pool_size` | `16` | Number of preallocated cuFile batch handles. |
+| `batch_pool_size` | `16` | Number of preallocated cuFile batch handles. Must be at least `submit_threads`. |
 | `batch_limit` | `128` | Maximum entries in one cuFile batch. |
 | `max_request_size` | `16777216` | Maximum bytes in one prepared I/O chunk. |
+| `submit_threads` | `4` | Number of persistent batch-submission workers. |
+| `submit_cpus` | empty | Optional comma-separated CPU ID, one per worker. |
+
+With no `submit_cpus`, Linux schedules the workers normally. When the option is
+set, every CPU must be unique, available to the process, and the number of CPUs
+must equal `submit_threads`; otherwise backend creation fails. For example:
+
+```text
+submit_threads=4
+submit_cpus=2,10,18,26
+```
+
+cuFile topology selection continues to choose GPU, storage, PCIe, and bounce
+buffer paths. Worker CPU affinity controls the separate blk-mq hardware-queue
+selection made when the worker submits I/O. A VRAM transfer uses up to
+`submit_threads` based on its number of prepared chunks; individual chunks are
+not split merely to occupy every worker.
+
+Future optimization: derive worker CPUs automatically from the backing block
+devices' blk-mq CPU maps and NUMA topology. This requires correct handling for
+device-mapper, RAID, and multi-device filesystems before it can replace explicit
+`submit_cpus` safely.
 
 [NVIDIA GDS](https://docs.nvidia.com/gpudirect-storage/overview-guide/index.html)<br />
 [CUDA GDS Install and Setup](https://docs.nvidia.com/cuda/cuda-installation-guide-linux/index.html)
