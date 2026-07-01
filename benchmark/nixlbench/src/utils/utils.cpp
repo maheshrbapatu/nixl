@@ -113,6 +113,13 @@ NB_ARG_STRING(filepath, "", "File path for storage operations");
 NB_ARG_STRING(filenames, "", "Comma-separated filenames for storage operations");
 NB_ARG_INT32(num_files, 1, "Number of files used by benchmark");
 NB_ARG_BOOL(storage_enable_direct, false, "Enable direct I/O for storage operations");
+NB_ARG_STRING(storage_access_pattern,
+              XFERBENCH_STORAGE_ACCESS_FIXED,
+              "Storage offset pattern [fixed, sequential]. Sequential recreates transfer "
+              "requests while advancing across storage_working_set_size bytes per file");
+NB_ARG_UINT64(storage_working_set_size,
+              0,
+              "Per-file working set in bytes for sequential storage access");
 
 // GDS options - only used when backend is GDS
 NB_ARG_INT32(gds_batch_pool_size,
@@ -285,6 +292,8 @@ int xferBenchConfig::posix_kernel_queue_size = 0;
 std::string xferBenchConfig::filepath = "";
 std::string xferBenchConfig::filenames = "";
 bool xferBenchConfig::storage_enable_direct = false;
+std::string xferBenchConfig::storage_access_pattern = XFERBENCH_STORAGE_ACCESS_FIXED;
+size_t xferBenchConfig::storage_working_set_size = 0;
 bool xferBenchConfig::reregister_mem = false;
 bool xferBenchConfig::prepared_xfer = false;
 int xferBenchConfig::pipeline_depth = 1;
@@ -512,12 +521,60 @@ xferBenchConfig::loadParams(void) {
     num_files = NB_ARG(num_files);
     posix_api_type = NB_ARG(posix_api_type);
     storage_enable_direct = NB_ARG(storage_enable_direct);
+    storage_access_pattern = NB_ARG(storage_access_pattern);
+    storage_working_set_size = NB_ARG(storage_working_set_size);
     recreate_xfer = NB_ARG(recreate_xfer);
     reregister_mem = NB_ARG(reregister_mem);
     prepared_xfer = NB_ARG(prepared_xfer);
     pipeline_depth = NB_ARG(pipeline_depth);
     if (pipeline_depth < 1) {
         std::cerr << "pipeline_depth must be >= 1" << std::endl;
+        return -1;
+    }
+    if (storage_access_pattern != XFERBENCH_STORAGE_ACCESS_FIXED &&
+        storage_access_pattern != XFERBENCH_STORAGE_ACCESS_SEQUENTIAL) {
+        std::cerr << "storage_access_pattern must be one of: fixed, sequential" << std::endl;
+        return -1;
+    }
+    if (storage_access_pattern == XFERBENCH_STORAGE_ACCESS_SEQUENTIAL) {
+        const bool supported_backend =
+            backend == XFERBENCH_BACKEND_GDS || backend == XFERBENCH_BACKEND_GDS_MT ||
+            backend == XFERBENCH_BACKEND_POSIX || backend == XFERBENCH_BACKEND_HF3FS;
+        if (!supported_backend) {
+            std::cerr << "sequential storage access is supported only for file storage "
+                         "backends (GDS, GDS_MT, POSIX, HF3FS)"
+                      << std::endl;
+            return -1;
+        }
+        const size_t minimum_working_set =
+            max_block_size * max_batch_size * static_cast<size_t>(pipeline_depth);
+        if (storage_working_set_size < minimum_working_set) {
+            std::cerr << "storage_working_set_size must be at least max_block_size * "
+                         "max_batch_size * pipeline_depth ("
+                      << minimum_working_set << ")" << std::endl;
+            return -1;
+        }
+        if (storage_working_set_size % max_block_size != 0) {
+            std::cerr << "storage_working_set_size must be divisible by max_block_size"
+                      << std::endl;
+            return -1;
+        }
+        if (num_files != num_threads * num_initiator_dev) {
+            std::cerr << "sequential storage access currently requires one file per benchmark "
+                         "thread/device buffer (num_files == num_threads * num_initiator_dev)"
+                      << std::endl;
+            return -1;
+        }
+        if (!recreate_xfer) {
+            std::cout << "Sequential storage access requires a new request for each offset "
+                         "window. Setting recreate_xfer to true."
+                      << std::endl;
+            recreate_xfer = true;
+        }
+    } else if (storage_working_set_size != 0) {
+        std::cerr << "storage_working_set_size is only valid with "
+                     "--storage_access_pattern=sequential"
+                  << std::endl;
         return -1;
     }
     use_hugepages = NB_ARG(use_hugepages);
@@ -757,6 +814,10 @@ xferBenchConfig::printConfig() {
             printOption("Number of files (--num_files=N)", std::to_string(num_files));
             printOption("Storage enable direct (--storage_enable_direct=[0,1])",
                         std::to_string(storage_enable_direct));
+            printOption("Storage access pattern (--storage_access_pattern=[fixed,sequential])",
+                        storage_access_pattern);
+            printOption("Storage working set (--storage_working_set_size=N)",
+                        std::to_string(storage_working_set_size));
         }
 
         // Print DOCA GPUNetIO options if backend is DOCA GPUNetIO

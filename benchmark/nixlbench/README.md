@@ -480,6 +480,10 @@ sudo systemctl start etcd && sudo systemctl enable etcd
 --filepath PATH            # File path for storage operations
 --num_files NUM            # Number of files used by benchmark (default: 1)
 --storage_enable_direct    # Enable direct I/O for storage operations
+--storage_access_pattern PATTERN
+                           # Storage offsets: fixed or sequential (default: fixed)
+--storage_working_set_size BYTES
+                           # Per-file byte range traversed by sequential mode
 ```
 
 #### Backend-Specific Options
@@ -666,6 +670,36 @@ $ host2 > sleep 2 && ./nixlbench --etcd_endpoints http://etcd-server:2379 --back
 # GDS with custom batch settings
 ./nixlbench --backend GDS --filepath /mnt/storage/testfile --gds_batch_pool_size 64 --gds_batch_limit 256
 ```
+
+**Sequential storage working set:**
+
+By default, NIXLBench creates a transfer request once and repeatedly posts the
+same descriptors. This `fixed` pattern measures the prepared-request hot path.
+Use `sequential` to advance each completed request by one full batch and wrap at
+an explicit per-file working-set boundary:
+
+```bash
+./nixlbench \
+  --backend GDS \
+  --filenames /mnt/storage/testfile \
+  --num_files 1 \
+  --storage_enable_direct \
+  --initiator_seg_type VRAM \
+  --op_type READ \
+  --start_block_size 1048576 \
+  --max_block_size 1048576 \
+  --start_batch_size 16 \
+  --max_batch_size 16 \
+  --total_buffer_size 16777216 \
+  --storage_access_pattern sequential \
+  --storage_working_set_size 4294967296
+```
+
+Sequential mode currently supports GDS, GDS_MT, POSIX, and HF3FS. It requires
+one file per benchmark thread/device buffer and a working set large enough for
+all batch entries and pipeline slots. Since file offsets are part of a NIXL
+transfer request, this mode recreates requests as it advances. Preparation time
+is therefore included and remains visible in the reported preparation metrics.
 
 **GDS_MT (Multi-threaded GDS):**
 ```bash

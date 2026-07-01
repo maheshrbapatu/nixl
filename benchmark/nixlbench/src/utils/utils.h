@@ -137,6 +137,10 @@
 #define XFERBENCH_SEG_TYPE_VRAM "VRAM"
 #define XFERBENCH_SEG_TYPE_BLK "BLK"
 
+// Storage access patterns
+#define XFERBENCH_STORAGE_ACCESS_FIXED "fixed"
+#define XFERBENCH_STORAGE_ACCESS_SEQUENTIAL "sequential"
+
 // Worker types
 #define XFERBENCH_WORKER_NIXL "nixl"
 #define XFERBENCH_WORKER_NVSHMEM "nvshmem"
@@ -187,6 +191,8 @@ public:
     static int posix_ios_pool_size;
     static int posix_kernel_queue_size;
     static bool storage_enable_direct;
+    static std::string storage_access_pattern;
+    static size_t storage_working_set_size;
     static bool reregister_mem;
     static bool prepared_xfer;
     static int pipeline_depth;

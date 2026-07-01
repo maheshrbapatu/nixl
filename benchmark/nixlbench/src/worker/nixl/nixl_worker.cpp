@@ -33,6 +33,7 @@
 #include <memory>
 #include <numeric>
 #include <sstream>
+#include <unordered_map>
 #include "utils/neuron.h"
 #include "utils/utils.h"
 #include <unistd.h>
@@ -763,22 +764,26 @@ xferBenchNixlWorker::initBasicDescFile(size_t buffer_size, xferFileState &fstate
         return ret;
     }
 
-    // Fill up with data
-    auto alloc = nixlAlloc::make(buffer_size);
+    // Fill the file in bounded chunks. Sequential storage workloads can use a
+    // multi-GiB working set, and allocating the whole region as host memory is
+    // unnecessary.
+    constexpr size_t FILE_INIT_CHUNK_SIZE = 16 * 1024 * 1024;
+    const size_t allocation_size = std::min(buffer_size, FILE_INIT_CHUNK_SIZE);
+    auto alloc = nixlAlloc::make(allocation_size);
     if (!alloc) {
-        std::cerr << "Failed to allocate " << buffer_size << " bytes of memory" << std::endl;
+        std::cerr << "Failed to allocate " << allocation_size << " bytes of memory" << std::endl;
         return std::nullopt;
     }
     void *buf = alloc->addr();
 
     // File is always initialized with XFERBENCH_TARGET_BUFFER_ELEMENT
-    memset(buf, XFERBENCH_TARGET_BUFFER_ELEMENT, buffer_size);
+    memset(buf, XFERBENCH_TARGET_BUFFER_ELEMENT, allocation_size);
 
     size_t offset = start_offset;
-    char *write_ptr = static_cast<char *>(buf);
     size_t remaining = buffer_size;
     while (remaining > 0) {
-        ssize_t rc = pwrite(fd, write_ptr, remaining, offset);
+        const size_t write_size = std::min(remaining, allocation_size);
+        ssize_t rc = pwrite(fd, buf, write_size, offset);
         if (rc < 0) {
             std::cerr << "Failed to write to file: " << fd << " with error: " << strerror(errno)
                       << std::endl;
@@ -787,7 +792,6 @@ xferBenchNixlWorker::initBasicDescFile(size_t buffer_size, xferFileState &fstate
 
         remaining -= rc;
         offset += rc;
-        write_ptr += rc;
     }
 
     if (end_offset > fstate.file_size) fstate.file_size = end_offset;
@@ -1056,7 +1060,12 @@ xferBenchNixlWorker::allocateMemory(int num_threads) {
             std::vector<xferBenchIOV> iov_list;
             for (i = 0; i < num_devices; i++) {
                 std::optional<xferBenchIOV> basic_desc;
-                basic_desc = initBasicDescFile(buffer_size, remote_fds[file_idx], i);
+                const size_t storage_region_size =
+                    xferBenchConfig::storage_access_pattern ==
+                            XFERBENCH_STORAGE_ACCESS_SEQUENTIAL ?
+                        xferBenchConfig::storage_working_set_size :
+                        buffer_size;
+                basic_desc = initBasicDescFile(storage_region_size, remote_fds[file_idx], i);
                 if (basic_desc) {
                     iov_list.push_back(basic_desc.value());
                 }
@@ -1534,6 +1543,22 @@ cleanupSlots(nixlAgent *agent, nixlBackendH *backend_engine, std::vector<slotSta
     }
 }
 
+// Advance a slot to the next non-overlapping file window. file_strides contains
+// the total bytes addressed per file across all pipeline slots and benchmark
+// threads, so concurrently active slots and threads retain their relative
+// spacing while the request ring advances.
+static void
+advanceSequentialStorageOffsets(slotState &slot,
+                                const std::unordered_map<int, size_t> &file_strides) {
+    const size_t working_set = xferBenchConfig::storage_working_set_size;
+    for (auto &iov : slot.remote_iov) {
+        const auto stride_it = file_strides.find(iov.devId);
+        assert(stride_it != file_strides.end());
+        iov.addr = (iov.addr + stride_it->second) % working_set;
+        assert(iov.addr + iov.len <= working_set);
+    }
+}
+
 // Run num_iter transfers using a sliding window of pipeline_depth in-flight
 // requests. Depth=1 collapses to the original "one create, N posts, one
 // release" baseline (the previous execTransferIterations); --recreate_xfer
@@ -1549,6 +1574,7 @@ execTransferLoop(nixlAgent *agent,
                  xferBenchStats &thread_stats,
                  const std::vector<xferBenchIOV> &local_iov,
                  const std::vector<xferBenchIOV> &remote_iov,
+                 const std::unordered_map<int, size_t> &storage_file_strides,
                  const std::atomic<int> *terminate_ptr = nullptr) {
     const int depth = std::min(xferBenchConfig::pipeline_depth, num_iter);
     if (depth < xferBenchConfig::pipeline_depth) {
@@ -1556,6 +1582,8 @@ execTransferLoop(nixlAgent *agent,
                   << ") exceeds num_iter (" << num_iter << "), capping to " << depth << std::endl;
     }
     const bool recreate = xferBenchConfig::recreate_xfer;
+    const bool sequential_storage =
+        xferBenchConfig::storage_access_pattern == XFERBENCH_STORAGE_ACCESS_SEQUENTIAL;
 
     if (local_iov.size() % depth != 0) {
         std::cerr << "Error: descriptor count (" << local_iov.size()
@@ -1641,6 +1669,9 @@ execTransferLoop(nixlAgent *agent,
                     cleanupSlots(agent, backend_engine, slots);
                     return -1;
                 }
+                if (sequential_storage) {
+                    advanceSequentialStorageOffsets(slots[s], storage_file_strides);
+                }
                 rc = prepareSlot(agent, backend_engine, op, target, params, thread_stats, slots[s]);
                 if (rc != NIXL_SUCCESS) [[unlikely]] {
                     std::cerr << "prepareSlot failed on resubmit for slot " << s << ": "
@@ -1678,6 +1709,15 @@ execTransfer(nixlAgent *agent,
     int ret = 0;
     stats.clear();
 
+    std::unordered_map<int, size_t> storage_file_strides;
+    if (xferBenchConfig::storage_access_pattern == XFERBENCH_STORAGE_ACCESS_SEQUENTIAL) {
+        for (const auto &thread_iovs : remote_iovs) {
+            for (const auto &iov : thread_iovs) {
+                storage_file_strides[iov.devId] += iov.len;
+            }
+        }
+    }
+
     xferBenchTimer total_timer;
 #pragma omp parallel num_threads(num_threads)
     {
@@ -1703,6 +1743,7 @@ execTransfer(nixlAgent *agent,
                                       thread_stats,
                                       local_iov,
                                       remote_iov,
+                                      storage_file_strides,
                                       terminate_ptr);
 
         if (result != 0) [[unlikely]] {
