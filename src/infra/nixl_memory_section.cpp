@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <atomic>
 #include <map>
 #include <algorithm>
 #include <iostream>
@@ -258,7 +259,7 @@ nixlLocalSection::addDescList(const nixl_reg_dlist_t &mem_elms,
             }
         }
 
-        *lp = normalizeSecDesc(mem, nixl_mem); // Copy the basic desc part
+        *lp = mem; // Copy the basic desc part
 
         local_batch.push_back(local_sec);
 
